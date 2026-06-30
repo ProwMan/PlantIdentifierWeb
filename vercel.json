@@ -2,11 +2,6 @@
   "buildCommand": "npm run build",
   "installCommand": "npm install",
   "outputDirectory": "dist/client",
-  "functions": {
-    "api/index.mjs": {
-      "runtime": "edge"
-    }
-  },
   "routes": [
     {
       "src": "^/assets/(.*)$",
