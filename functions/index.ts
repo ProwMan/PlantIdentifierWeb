@@ -96,30 +96,41 @@ export const emailWeeklyTopScorers = functions.pubsub
 <html>
 <head>
   <style>
-    body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
-    .container { max-width: 800px; margin: 0 auto; padding: 20px; }
-    h1 { color: #2c5f2d; text-align: center; }
-    .scorer-card { 
-      border: 1px solid #ddd; 
-      padding: 15px; 
-      margin-bottom: 15px; 
-      border-radius: 8px; 
-      background-color: #f9f9f9; 
-    }
-    .scorer-name { font-size: 18px; font-weight: bold; color: #2c5f2d; }
-    .scores { margin: 10px 0; }
-    .score-item { margin: 5px 0; }
-    .total { color: #d4a574; font-weight: bold; }
-    .weekly { color: #667d3e; font-weight: bold; }
-    .activity { margin-top: 10px; }
-    .day { display: inline-block; margin-right: 10px; }
-    .timestamp { font-size: 12px; color: #999; text-align: center; margin-top: 20px; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; line-height: 1.6; color: #1d1d1f; background: #f5f5f7; }
+    .container { max-width: 680px; margin: 0 auto; padding: 40px 20px; }
+    .card { background: white; border-radius: 24px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
+    .header { background: linear-gradient(135deg, #00205c 0%, #003d99 100%); padding: 40px; text-align: center; }
+    .header h1 { color: #ffc629; margin: 0; font-size: 28px; font-weight: 800; letter-spacing: -0.02em; }
+    .header p { color: rgba(255,255,255,0.8); margin: 8px 0 0; font-size: 15px; }
+    .content { padding: 32px 40px; }
+    .scorer { border-bottom: 1px solid #f0f0f0; padding: 20px 0; display: flex; align-items: center; gap: 16px; }
+    .scorer:last-child { border-bottom: none; }
+    .rank { width: 40px; height: 40px; border-radius: 12px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px; flex-shrink: 0; }
+    .rank-1 { background: linear-gradient(135deg, #ffc629, #e5a500); color: #001030; }
+    .rank-2 { background: linear-gradient(135deg, #c0c0c0, #a0a0a0); color: white; }
+    .rank-3 { background: linear-gradient(135deg, #cd7f32, #b87333); color: white; }
+    .rank-other { background: #f0f0f0; color: #666; }
+    .info { flex: 1; min-width: 0; }
+    .name { font-weight: 700; font-size: 16px; color: #1d1d1f; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .scores { display: flex; gap: 12px; margin-top: 6px; flex-wrap: wrap; }
+    .score { font-size: 13px; font-weight: 600; padding: 4px 10px; border-radius: 8px; }
+    .total { background: #fff4e6; color: #916b00; }
+    .weekly { background: #e8f5e9; color: #2e7d32; }
+    .activity { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+    .day { font-size: 11px; padding: 3px 8px; background: #f5f5f7; border-radius: 6px; color: #666; }
+    .day strong { color: #1d1d1f; }
+    .footer { padding: 24px 40px; background: #fafafa; text-align: center; border-top: 1px solid #f0f0f0; }
+    .footer p { margin: 0; font-size: 13px; color: #888; }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>🌿 Weekly Plant Spotter Leaderboard 🌿</h1>
-    <p style="text-align: center; color: #666;">Top 10 Scorers for the Week</p>
+    <div class="card">
+      <div class="header">
+        <h1>🌿 Weekly Plant Spotter Leaderboard</h1>
+        <p>Top 10 Scorers for the Week</p>
+      </div>
+      <div class="content">
 `;
 
       topScorers.forEach((scorer, index) => {
@@ -135,30 +146,33 @@ export const emailWeeklyTopScorers = functions.pubsub
         const activityList = days
           .map(
             (day) =>
-              `<span class="day"><strong>${day}</strong>: ${scorer.activity[day] || 0}</span>`
+              `<span class="day"><strong>${day.slice(0, 3)}</strong>: ${scorer.activity[day] || 0}</span>`
           )
           .join("");
 
+        const rankClass = index === 0 ? "rank-1" : index === 1 ? "rank-2" : index === 2 ? "rank-3" : "rank-other";
+
         htmlContent += `
-    <div class="scorer-card">
-      <div class="scorer-name">#${index + 1} ${scorer.student}</div>
-      <div class="scores">
-        <div class="score-item"><span class="total">Total Score: ${scorer.totalScore} pts</span></div>
-        <div class="score-item"><span class="weekly">This Week: ${scorer.weeklyScore} pts</span></div>
-      </div>
-      <div class="activity">
-        <strong>Daily Activity:</strong><br/>
-        ${activityList}
-      </div>
-    </div>
+        <div class="scorer">
+          <div class="rank ${rankClass}">${index + 1}</div>
+          <div class="info">
+            <div class="name">${scorer.student}</div>
+            <div class="scores">
+              <span class="score total">Total: ${scorer.totalScore} pts</span>
+              <span class="score weekly">This Week: ${scorer.weeklyScore} pts</span>
+            </div>
+            <div class="activity">${activityList}</div>
+          </div>
+        </div>
 `;
       });
 
       htmlContent += `
-    <div class="timestamp">
-      Report generated on ${new Date().toLocaleString("en-SG", {
-        timeZone: "Asia/Singapore",
-      })}
+      </div>
+      <div class="footer">
+        <p>Report generated on ${new Date().toLocaleString("en-SG", { timeZone: "Asia/Singapore" })}</p>
+        <p style="margin-top: 8px; font-size: 12px;">Environment Focus Group • ACS Independent</p>
+      </div>
     </div>
   </div>
 </body>

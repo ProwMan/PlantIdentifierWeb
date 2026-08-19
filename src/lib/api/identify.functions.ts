@@ -9,9 +9,9 @@ export type PlantSuggestion = {
   wikiUrl?: string;
 };
 
-// Profanity filter list - User can expand this
+// Profanity filter list
 const VULGARITIES = [
-  "fuck", "shit", "ass", "bitch", "dick", "pussy", "bastard", "cunt", 
+  "fuck", "shit", "ass", "bitch", "dick", "pussy", "bastard", "cunt",
   "nigger", "faggot", "slut", "whore", "cock", "vagina", "anus",
   "asshole", "retard", "rape", "sex", "porn", "cum", "tit"
 ];
@@ -25,7 +25,7 @@ function containsProfanity(text: string): boolean {
 const CLASS_REGEX = /^[1-6]\.(0[1-9]|1[0-8])$/;
 
 export const loginUser = createServerFn({ method: "POST" })
-  .validator(z.object({ 
+  .validator(z.object({
     fullName: z.string().min(2).max(50),
     className: z.string().refine((val) => CLASS_REGEX.test(val), {
       message: "Invalid class format. Use x.yy (e.g., 1.01 to 6.18)"
@@ -33,7 +33,7 @@ export const loginUser = createServerFn({ method: "POST" })
   }))
   .handler(async ({ data }) => {
     const crypto = await import("node:crypto");
-    
+
     const { fullName, className } = data;
 
     if (containsProfanity(fullName)) {
@@ -64,6 +64,32 @@ function dataUrlToBlob(dataUrl: string): { blob: Blob; filename: string } {
   return { blob: new Blob([bytes], { type: mime }), filename: `plant.${ext}` };
 }
 
+// Server function to upsert user profile (runs server-side with service role, bypasses RLS)
+export const upsertUser = createServerFn({ method: "POST" })
+  .validator(z.object({
+    uid: z.string(),
+    fullName: z.string().min(2).max(50),
+    className: z.string().refine((val) => CLASS_REGEX.test(val), {
+      message: "Invalid class format. Use x.yy (e.g., 1.01 to 6.18)"
+    })
+  }))
+  .handler(async ({ data }) => {
+    const { createClient } = await import("@supabase/supabase-js");
+    const supabaseUrl = process.env.SUPABASE_URL!;
+    const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+    const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey);
+
+    const { error } = await supabaseAdmin.from("users").upsert({
+      id: data.uid,
+      full_name: data.fullName.trim(),
+      class_name: data.className.trim(),
+      last_login: new Date().toISOString(),
+    });
+
+    if (error) throw error;
+    return { success: true };
+  });
+
 export const identifyPlant = createServerFn({ method: "POST" })
   .validator(inputSchema)
   .handler(async ({ data }): Promise<{ suggestions: PlantSuggestion[]; mocked: boolean }> => {
@@ -91,8 +117,16 @@ export const identifyPlant = createServerFn({ method: "POST" })
 
     const json = (await res.json()) as any;
 
-    const suggestions: PlantSuggestion[] = (json.results ?? [])
-      .filter((r: any) => r.score >= 0.6)
+    // Check if we have results with sufficient confidence
+    const results = (json.results ?? [])
+      .filter((r: any) => r.score >= 0.6);
+
+    if (results.length === 0) {
+      // Return empty suggestions - the client will handle this as "not found"
+      return { suggestions: [], mocked: false };
+    }
+
+    const suggestions: PlantSuggestion[] = results
       .slice(0, 3)
       .map((r: any) => ({
         name: r.species.scientificNameWithoutAuthor ?? r.species.scientificName ?? "Unknown",
