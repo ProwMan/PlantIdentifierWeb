@@ -7,7 +7,6 @@ import {
   Trophy,
   Shield,
   ChevronLeft,
-  ShieldCheck,
   ShieldAlert,
   LogOut,
   User as UserIcon,
@@ -20,8 +19,21 @@ import {
   XCircle,
   Sparkles,
 } from "lucide-react";
-import { identifyPlant, loginUser, upsertUser, type PlantSuggestion } from "@/lib/api/identify.functions";
-import { supabase, type User, type Discovery, type LeaderboardEntry, type UserStats } from "@/lib/supabase";
+import {
+  identifyPlant,
+  loginUser,
+  recordDiscovery,
+  upsertUser,
+  type PlantSuggestion,
+} from "@/lib/api/identify.functions";
+import {
+  supabase,
+  type User,
+  type Discovery,
+  type LeaderboardEntry,
+  type UserStats,
+} from "@/lib/supabase";
+import { verifySchoolLocation, locationFailureMessage } from "@/lib/location";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -41,20 +53,56 @@ type Phase =
   | "credits"
   | "error";
 
-const ACSI_LAT = 1.3001;
-const ACSI_LNG = 103.7812;
+type ErrorKind = "not_found" | "technical" | "camera";
 
-function getDistance(lat1: number, lon1: number, lat2: number, lon2: number) {
-  const R = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+// Supabase/network outages surface as a bare "fetch failed" inside a TypeError, which
+// tells a student nothing useful. Keep the original text (needed for debugging) and
+// append actionable guidance.
+const CONNECTIVITY_FAILURE = /fetch failed|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|getaddrinfo/i;
+// PostgREST answers with these codes when a table or function is missing entirely.
+const MISSING_SCHEMA = /in the schema cache|PGRST20[25]/i;
+
+// Server-function errors cross the wire as serialized values, which are often plain
+// objects (e.g. Supabase's PostgrestError: {message, details, hint, code}) rather than
+// Error instances. `String(obj)` would render those as "[object Object]", hiding the
+// real cause, so pull the human-readable fields out explicitly.
+function describeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  if (err && typeof err === "object") {
+    const { message, details, hint, code } = err as {
+      message?: unknown;
+      details?: unknown;
+      hint?: unknown;
+      code?: unknown;
+    };
+    const parts = [message, details, hint].filter(
+      (part): part is string => typeof part === "string" && part.length > 0,
+    );
+    if (parts.length > 0) {
+      return code === undefined || code === null || code === ""
+        ? parts.join(" — ")
+        : `${parts.join(" — ")} (${String(code)})`;
+    }
+  }
+  try {
+    const json = JSON.stringify(err);
+    if (json && json !== "{}") return json;
+  } catch {
+    // Circular structure — fall through to String().
+  }
+  return String(err);
+}
+
+function errorMessage(err: unknown): string {
+  const base = describeError(err);
+  if (CONNECTIVITY_FAILURE.test(base)) {
+    return `${base} — the app could not reach the database. Check the internet connection and that the Supabase project is active.`;
+  }
+  if (MISSING_SCHEMA.test(base)) {
+    return `${base} — the database schema is missing. Run supabase/migrations/001_initial_schema.sql in the Supabase SQL Editor.`;
+  }
+  return base;
 }
 
 // --- Sub-components ---
@@ -68,7 +116,6 @@ function PageContainer({
   studentName,
   userPoints,
   title,
-  isVerified,
   onLogout,
 }: {
   children: React.ReactNode;
@@ -79,7 +126,6 @@ function PageContainer({
   studentName: string;
   userPoints: number;
   title?: string;
-  isVerified: boolean;
   onLogout?: () => void;
 }) {
   return (
@@ -123,11 +169,6 @@ function PageContainer({
                   </button>
                 </div>
                 <div className="flex items-center gap-2 mt-1">
-                  <div
-                    className={`flex items-center gap-1 text-[8px] font-bold px-2 py-0.5 rounded-full border ${isVerified ? "text-emerald-400 border-emerald-400 bg-emerald-400/10" : "text-red-400 border-red-400 bg-red-400/10"}`}
-                  >
-                    {isVerified ? "Area Verified" : "Outside Area"}
-                  </div>
                   <div className="text-[10px] font-bold text-[color:var(--acs-gold)] flex items-center gap-1">
                     {userPoints} <Trophy className="h-3 w-3 fill-current" />
                   </div>
@@ -135,9 +176,7 @@ function PageContainer({
               </div>
             )}
           </div>
-          {title && (
-            <h2 className="text-3xl font-black text-white drop-shadow-md">{title}</h2>
-          )}
+          {title && <h2 className="text-3xl font-black text-white drop-shadow-md">{title}</h2>}
         </header>
       )}
       <div className="w-full max-w-md flex-1 flex flex-col relative px-6 overflow-y-auto no-scrollbar">
@@ -147,12 +186,13 @@ function PageContainer({
   );
 }
 
-function GlassCard({ children, className = "", ...props }: React.HTMLAttributes<HTMLDivElement> & { children: React.ReactNode }) {
+function GlassCard({
+  children,
+  className = "",
+  ...props
+}: React.HTMLAttributes<HTMLDivElement> & { children: React.ReactNode }) {
   return (
-    <div
-      className={`liquid-glass p-6 rounded-[2rem] border-white/10 ${className}`}
-      {...props}
-    >
+    <div className={`liquid-glass p-6 rounded-[2rem] border-white/10 ${className}`} {...props}>
       {children}
     </div>
   );
@@ -165,12 +205,16 @@ function ActionButton({
   className = "",
   disabled = false,
   ...props
-}: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "primary" | "secondary" | "accent" | "danger" }) {
+}: React.ButtonHTMLAttributes<HTMLButtonElement> & {
+  variant?: "primary" | "secondary" | "accent" | "danger";
+}) {
   const variants = {
-    primary: "bg-gradient-to-br from-[color:var(--acs-gold)] to-[#e5a500] text-[color:var(--acs-blue-dark)] font-black border-b-4 border-black/20",
+    primary:
+      "bg-gradient-to-br from-[color:var(--acs-gold)] to-[#e5a500] text-[color:var(--acs-blue-dark)] font-black border-b-4 border-black/20",
     secondary: "liquid-glass-beige border-white/20 text-white font-black",
     accent: "liquid-glass-gold border-white/20 text-white font-black",
-    danger: "bg-gradient-to-br from-red-500 to-red-600 text-white font-black border-b-4 border-red-700/50",
+    danger:
+      "bg-gradient-to-br from-red-500 to-red-600 text-white font-black border-b-4 border-red-700/50",
   };
 
   return (
@@ -193,16 +237,13 @@ function IconButton({
   ...props
 }: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "default" | "ghost" }) {
   const variants = {
-    default: "text-white bg-black/40 backdrop-blur-lg p-2 rounded-full border border-white/10 active:scale-90 hover:scale-105 transition-transform",
+    default:
+      "text-white bg-black/40 backdrop-blur-lg p-2 rounded-full border border-white/10 active:scale-90 hover:scale-105 transition-transform",
     ghost: "text-white/40 hover:text-white transition-colors active:scale-90",
   };
 
   return (
-    <button
-      onClick={onClick}
-      className={`${variants[variant]} ${className}`}
-      {...props}
-    >
+    <button onClick={onClick} className={`${variants[variant]} ${className}`} {...props}>
       {children}
     </button>
   );
@@ -212,7 +253,11 @@ function Toast({
   message,
   type = "info",
   onClose,
-}: { message: string; type?: "info" | "success" | "error" | "warning"; onClose: () => void }) {
+}: {
+  message: string;
+  type?: "info" | "success" | "error" | "warning";
+  onClose: () => void;
+}) {
   const icons = {
     info: <Info className="h-5 w-5" />,
     success: <CheckCircle className="h-5 w-5" />,
@@ -233,7 +278,10 @@ function Toast({
     >
       <div className="flex-shrink-0">{icons[type]}</div>
       <p className="font-medium text-sm">{message}</p>
-      <button onClick={onClose} className="ml-auto text-white/60 hover:text-white transition-colors">
+      <button
+        onClick={onClose}
+        className="ml-auto text-white/60 hover:text-white transition-colors"
+      >
         <XCircle className="h-4 w-4" />
       </button>
     </div>
@@ -266,9 +314,13 @@ function ResultCard({
   discoveries: Discovery[];
 }) {
   if (!suggestion) return null;
-  const foundBefore = user && discoveries.some(
-    (d) => d.user_id === user.id && d.scientific_name?.toLowerCase() === suggestion.name?.toLowerCase(),
-  );
+  const foundBefore =
+    user &&
+    discoveries.some(
+      (d) =>
+        d.user_id === user.id &&
+        d.scientific_name?.toLowerCase() === suggestion.name?.toLowerCase(),
+    );
 
   return (
     <button
@@ -307,21 +359,88 @@ function ResultCard({
   );
 }
 
-function NoResultsCard({ onRetry }: { onRetry: () => void }) {
+const ERROR_CONTENT: Record<
+  ErrorKind,
+  { title: string; summary: string; tips: string[]; showDetails: boolean }
+> = {
+  not_found: {
+    title: "Plant Not Found",
+    summary: "We couldn't match that photo to a plant with enough confidence.",
+    tips: [
+      "Fill the frame with a single leaf, flower or fruit",
+      "Use daylight and hold the phone steady",
+      "Avoid blur, glare and harsh shadows",
+    ],
+    showDetails: false,
+  },
+  technical: {
+    title: "Identification Failed",
+    summary: "Something went wrong while identifying your photo. You were not charged any points.",
+    tips: ["Check your internet connection", "Wait a moment, then try again"],
+    showDetails: true,
+  },
+  camera: {
+    title: "Camera Unavailable",
+    summary: "The camera could not be opened, so no photo was taken.",
+    tips: [
+      "Allow camera access for this site in your browser settings",
+      "Close other apps that may be using the camera",
+    ],
+    showDetails: true,
+  },
+};
+
+export function ErrorCard({
+  kind,
+  details,
+  onRetry,
+  onBack,
+}: {
+  kind: ErrorKind;
+  details: string | null;
+  onRetry: () => void;
+  onBack: () => void;
+}) {
+  const content = ERROR_CONTENT[kind];
+  const Icon = kind === "not_found" ? XCircle : kind === "camera" ? Camera : AlertCircle;
+
   return (
     <div className="liquid-glass p-8 rounded-[2rem] border-white/10 text-center flex flex-col items-center gap-6">
-      <div className="bg-red-500/20 p-4 rounded-full">
-        <XCircle className="h-10 w-10 text-red-400 mx-auto" />
+      <div
+        className={`p-4 rounded-full ${kind === "not_found" ? "bg-red-500/20" : "bg-amber-500/20"}`}
+      >
+        <Icon
+          className={`h-10 w-10 mx-auto ${kind === "not_found" ? "text-red-400" : "text-amber-400"}`}
+        />
       </div>
       <div>
-        <h3 className="text-xl font-black text-white mb-2">Plant Not Found</h3>
-        <p className="text-white/60 text-sm leading-relaxed max-w-xs">
-          We couldn't identify this plant with enough confidence. Try taking a clearer photo with good lighting, focusing on leaves or flowers.
-        </p>
+        <h3 className="text-xl font-black text-white mb-2">{content.title}</h3>
+        <p className="text-white/60 text-sm leading-relaxed max-w-xs mx-auto">{content.summary}</p>
       </div>
-      <ActionButton variant="primary" onClick={onRetry}>
-        Try Again
-      </ActionButton>
+      <ul className="w-full text-left text-xs text-white/70 space-y-2 bg-black/20 rounded-2xl p-4 border border-white/5">
+        {content.tips.map((tip) => (
+          <li key={tip} className="flex gap-2">
+            <span className="text-[color:var(--acs-gold)] font-black">•</span>
+            <span>{tip}</span>
+          </li>
+        ))}
+      </ul>
+      {content.showDetails && details && (
+        <details className="w-full text-left text-[11px] text-white/40 bg-black/20 rounded-xl p-3 border border-white/5">
+          <summary className="cursor-pointer font-bold uppercase tracking-widest text-[9px]">
+            Technical details
+          </summary>
+          <p className="mt-2 break-words">{details}</p>
+        </details>
+      )}
+      <div className="w-full space-y-3">
+        <ActionButton variant="primary" onClick={onRetry}>
+          {kind === "not_found" ? "Take Another Photo" : "Try Again"}
+        </ActionButton>
+        <ActionButton variant="secondary" onClick={onBack}>
+          Back to Menu
+        </ActionButton>
+      </div>
     </div>
   );
 }
@@ -330,7 +449,11 @@ function SuccessOverlay({
   isNewDiscovery,
   points,
   onContinue,
-}: { isNewDiscovery: boolean; points: number; onContinue: () => void }) {
+}: {
+  isNewDiscovery: boolean;
+  points: number;
+  onContinue: () => void;
+}) {
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center p-8 bg-black/80 backdrop-blur-2xl animate-in fade-in duration-300">
       <div className="liquid-glass-dark border-4 border-[color:var(--acs-gold)]/30 rounded-[3.5rem] p-12 w-full flex flex-col items-center text-center shadow-2xl animate-in zoom-in-95 duration-300">
@@ -395,92 +518,150 @@ function Index() {
   const [discoveries, setDiscoveries] = useState<Discovery[]>([]);
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
   const [userStats, setUserStats] = useState<UserStats | null>(null);
-  const [successOverlay, setSuccessOverlay] = useState<{ isNew: boolean; points: number } | null>(null);
+  const [successOverlay, setSuccessOverlay] = useState<{ isNew: boolean; points: number } | null>(
+    null,
+  );
 
-  const [locationState, setLocationState] = useState<"unknown" | "verified" | "outside">("unknown");
-  const isVerified = locationState === "verified";
-  const isOutside = locationState === "outside";
+  // Shutter state: true while a fresh GPS fix (and, after that, the request) is in flight.
+  const [isCapturing, setIsCapturing] = useState(false);
+  // Inline failure shown over the viewfinder; the camera stays open so they can retry.
+  const [captureError, setCaptureError] = useState<string | null>(null);
+  const [errorKind, setErrorKind] = useState<ErrorKind>("technical");
+  const statsErrorShown = useRef(false);
+  const leaderboardErrorShown = useRef(false);
 
-  const [toasts, setToasts] = useState<Array<{ id: number; message: string; type: "info" | "success" | "error" | "warning" }>>([]);
+  const [toasts, setToasts] = useState<
+    Array<{ id: number; message: string; type: "info" | "success" | "error" | "warning" }>
+  >([]);
 
-  const showToast = useCallback((message: string, type: "info" | "success" | "error" | "warning" = "info", duration = 4000) => {
-    const id = Date.now();
-    setToasts(prev => [...prev, { id, message, type }]);
-    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), duration);
-  }, []);
+  const showToast = useCallback(
+    (message: string, type: "info" | "success" | "error" | "warning" = "info", duration = 4000) => {
+      const id = Date.now();
+      setToasts((prev) => [...prev, { id, message, type }]);
+      setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), duration);
+    },
+    [],
+  );
+
+  const fetchUserStats = useCallback(async () => {
+    if (!user) return;
+    const { data, error } = await supabase.rpc("get_user_stats", { p_user_id: user.id });
+
+    if (error) {
+      // Previously swallowed, so a broken stats function looked like "0 points forever".
+      console.error("Could not load points:", error);
+      if (!statsErrorShown.current) {
+        statsErrorShown.current = true;
+        showToast(`Could not load your points: ${errorMessage(error)}`, "error", 6000);
+      }
+      return;
+    }
+
+    if (data?.[0]) {
+      setUserStats(data[0] as UserStats);
+    }
+  }, [user, showToast]);
+
+  // Only the signed-in student's own rows. The Collection page and the "already discovered"
+  // hint need that student's full history; the old query took the 100 newest rows across the
+  // whole school, so an older species looked new to the UI while the server scored it 1 point.
+  const fetchDiscoveries = useCallback(async () => {
+    if (!user) {
+      setDiscoveries([]);
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("discoveries")
+      .select("*")
+      .eq("user_id", user.id)
+      .order("found_at", { ascending: false })
+      .limit(1000);
+
+    if (error) {
+      console.error("Could not load discoveries:", error);
+      return;
+    }
+
+    if (data) {
+      setDiscoveries(data as Discovery[]);
+      void fetchUserStats();
+    }
+  }, [user, fetchUserStats]);
+
+  const fetchLeaderboard = useCallback(async () => {
+    const { data, error } = await supabase.rpc("get_leaderboard");
+
+    if (error) {
+      console.error("Could not load the leaderboard:", error);
+      if (!leaderboardErrorShown.current) {
+        leaderboardErrorShown.current = true;
+        showToast(`Could not load the leaderboard: ${errorMessage(error)}`, "error", 6000);
+      }
+      return;
+    }
+
+    if (data) {
+      setLeaderboard(data as LeaderboardEntry[]);
+    }
+  }, [showToast]);
+
+  // Unique species the signed-in student has personally discovered (used by the Collection page).
+  // Declared here, at the top level, so hook order never changes with `phase`.
+  const userBadges = useMemo(() => {
+    if (!user || !discoveries?.length) return [] as Discovery[];
+    const unique = new Map<string, Discovery>();
+    discoveries
+      .filter((d) => d.user_id === user.id)
+      .forEach((d) => {
+        if (d.scientific_name && !unique.has(d.scientific_name)) unique.set(d.scientific_name, d);
+      });
+    return Array.from(unique.values());
+  }, [discoveries, user]);
 
   // Custom auth: Check localStorage for existing session on load
   useEffect(() => {
     const storedUid = localStorage.getItem("plant_spotter_uid");
-    if (storedUid) {
-      // Fetch user profile from database
-      supabase
-        .from("users")
-        .select("*")
-        .eq("id", storedUid)
-        .single()
-        .then(({ data: profile }) => {
-          if (profile) {
-            setUser(profile);
-            setPhase("menu");
-          } else {
-            localStorage.removeItem("plant_spotter_uid");
-          }
-        })
-        .catch(() => {
+    if (!storedUid) return;
+
+    void (async () => {
+      try {
+        // Fetch user profile from database
+        const { data: profile } = await supabase
+          .from("users")
+          .select("*")
+          .eq("id", storedUid)
+          .single();
+
+        if (profile) {
+          setUser(profile);
+          setPhase("menu");
+        } else {
           localStorage.removeItem("plant_spotter_uid");
-        });
-    }
+        }
+      } catch {
+        localStorage.removeItem("plant_spotter_uid");
+      }
+    })();
   }, []);
 
   // Subscribe to discoveries
   useEffect(() => {
     const channel = supabase
       .channel("discoveries_changes")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "discoveries" },
-        () => fetchDiscoveries()
-      )
+      .on("postgres_changes", { event: "*", schema: "public", table: "discoveries" }, () => {
+        void fetchDiscoveries();
+        void fetchLeaderboard();
+      })
       .subscribe();
 
-    fetchDiscoveries();
-    fetchLeaderboard();
+    void fetchDiscoveries();
+    void fetchLeaderboard();
 
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [user]);
-
-  const fetchDiscoveries = async () => {
-    const { data, error } = await supabase
-      .from("discoveries")
-      .select("*")
-      .order("found_at", { ascending: false })
-      .limit(100);
-
-    if (!error && data) {
-      setDiscoveries(data as Discovery[]);
-      if (user) {
-        fetchUserStats();
-      }
-    }
-  };
-
-  const fetchLeaderboard = async () => {
-    const { data, error } = await supabase.rpc("get_leaderboard");
-    if (!error && data) {
-      setLeaderboard(data as LeaderboardEntry[]);
-    }
-  };
-
-  const fetchUserStats = async () => {
-    if (!user) return;
-    const { data, error } = await supabase.rpc("get_user_stats", { p_user_id: user.id });
-    if (!error && data?.[0]) {
-      setUserStats(data[0] as UserStats);
-    }
-  };
+  }, [fetchDiscoveries, fetchLeaderboard]);
 
   async function handleAuth() {
     setAuthError("");
@@ -500,12 +681,20 @@ function Index() {
 
       // Store session in localStorage
       localStorage.setItem("plant_spotter_uid", uid);
-      setUser({ id: uid, full_name: fullName.trim(), class_name: className.trim(), display_name: displayName, last_login: new Date().toISOString(), created_at: new Date().toISOString() });
+      setUser({
+        id: uid,
+        full_name: fullName.trim(),
+        class_name: className.trim(),
+        display_name: displayName,
+        last_login: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+      });
       setPhase("menu");
       showToast("Welcome to Plant Spotter!", "success");
-    } catch (err: any) {
-      setAuthError(err.message);
-      showToast(err.message, "error");
+    } catch (err: unknown) {
+      console.error("Login failed:", err);
+      setAuthError(errorMessage(err));
+      showToast(errorMessage(err), "error");
     } finally {
       setIsLoading(false);
     }
@@ -514,6 +703,9 @@ function Index() {
   async function handleLogout() {
     localStorage.removeItem("plant_spotter_uid");
     setUser(null);
+    // Clear the previous student's totals so the header never shows someone else's points.
+    setUserStats(null);
+    setDiscoveries([]);
     setPhase("login");
     showToast("Logged out successfully", "info");
   }
@@ -525,41 +717,14 @@ function Index() {
 
   async function startCamera() {
     setError(null);
+    setCaptureError(null);
 
     if (typeof window === "undefined") return;
-    if (!navigator.geolocation) {
-      showToast("Location access is required to identify plants.", "error");
-      return;
-    }
 
-    const locationOk = await new Promise<boolean>((resolve) => {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          const dist = getDistance(pos.coords.latitude, pos.coords.longitude, ACSI_LAT, ACSI_LNG);
-          const ok = dist <= 0.5;
-          if (!ok) {
-            showToast(`Action Blocked: You must be within 0.5km of ACS Independent. Current distance: ${dist.toFixed(2)}km`, "error");
-            setLocationState("outside");
-          } else {
-            showToast("Location verified!", "success");
-            setLocationState("verified");
-          }
-          resolve(ok);
-        },
-        () => {
-          showToast("Action Blocked: Location access is required to verify you are in school.", "error");
-          setLocationState("outside");
-          resolve(false);
-        },
-        { timeout: 5000, enableHighAccuracy: true },
-      );
-    });
-
-    if (locationState !== "verified") {
-      return;
-    }
-
+    // No GPS gate here. Location is decided once per photo, in capture(); a pre-flight
+    // check duplicated it and kept the viewfinder closed on a slow first fix.
     setPhase("camera");
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "environment" },
@@ -567,144 +732,115 @@ function Index() {
       streamRef.current = stream;
       setTimeout(() => {
         if (videoRef.current) videoRef.current.srcObject = stream;
-        videoRef.current?.play();
+        void videoRef.current?.play();
       }, 200);
-    } catch {
-      setPhase("error");
-      showToast("Camera access denied", "error");
-    }
-  }
-
-  async function checkVerification() {
-    if (typeof window === "undefined") return;
-
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          const dist = getDistance(pos.coords.latitude, pos.coords.longitude, ACSI_LAT, ACSI_LNG);
-          const ok = dist <= 0.5;
-          if (!ok) {
-            showToast(`Outside Area: You are ${dist.toFixed(2)}km away. Please be within 0.5km of ACS Independent.`, "error");
-            setLocationState("outside");
-          } else {
-            showToast("Location Verified! You are within the school area.", "success");
-            setLocationState("verified");
-          }
-        },
-        () => {
-          setLocationState("outside");
-          showToast("Location Error: Please enable GPS/Location access to verify you are in school.", "error");
-        },
-        { timeout: 5000, enableHighAccuracy: true },
-      );
-    }
-  }
-
-  async function capture() {
-    const video = videoRef.current;
-    if (!video) return;
-
-    if (typeof window === "undefined") return;
-
-    // ALWAYS verify location on EVERY capture attempt
-    const checkLoc = () =>
-      new Promise<boolean>((resolve) => {
-        if (!navigator.geolocation) return resolve(false);
-        navigator.geolocation.getCurrentPosition(
-          (pos) => {
-            const dist = getDistance(pos.coords.latitude, pos.coords.longitude, ACSI_LAT, ACSI_LNG);
-            const ok = dist <= 0.5;
-            if (!ok) {
-              showToast(`Action Blocked: You must be within 0.5km of ACS Independent. Current distance: ${dist.toFixed(2)}km`, "error");
-            }
-            resolve(ok);
-          },
-          () => {
-            showToast("Action Blocked: Location access is required to verify you are in school.", "error");
-            resolve(false);
-          },
-          { timeout: 5000, enableHighAccuracy: true },
-        );
-      });
-
-    const isLocOk = await checkLoc();
-    if (!isLocOk) {
-      setLocationState("outside");
-      setPhase("menu");
+    } catch (err: unknown) {
+      console.error("Camera unavailable:", err);
       stopCamera();
-      return;
+      setErrorKind("camera");
+      setError(describeError(err));
+      setPhase("error");
     }
-    setLocationState("verified");
+  }
 
-    const canvas = document.createElement("canvas");
-    canvas.width = 1024;
-    canvas.height = 1024;
-    canvas
-      .getContext("2d")
-      ?.drawImage(video, 0, 0, video.videoWidth, video.videoHeight, 0, 0, 1024, 1024);
-    const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
-    setSnapshot(dataUrl);
-    stopCamera();
-    setPhase("identifying");
-
+  async function runIdentification(dataUrl: string) {
     try {
       const result = await identify({ data: { imageDataUrl: dataUrl } });
       setSuggestions(result.suggestions);
 
       if (result.suggestions.length === 0) {
+        setErrorKind("not_found");
+        setError(null);
         setPhase("error");
-        setError("No plant found with sufficient confidence. Please try again with a clearer photo.");
       } else {
         setPhase("results");
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
+      console.error("Identification failed:", err);
+      setErrorKind("technical");
+      setError(errorMessage(err));
       setPhase("error");
-      setError(err.message);
-      showToast(err.message, "error");
+      showToast(errorMessage(err), "error");
+    }
+  }
+
+  async function capture() {
+    if (isCapturing) return;
+
+    const video = videoRef.current;
+    if (!video) return;
+
+    setIsCapturing(true);
+    setCaptureError(null);
+
+    try {
+      // A brand-new GPS fix on EVERY shutter press — the earlier verification is never reused.
+      const check = await verifySchoolLocation();
+
+      if (!check.ok) {
+        setCaptureError(locationFailureMessage(check));
+        showToast(locationFailureMessage(check), "error", 6000);
+        // Keep the viewfinder open so the student can walk closer and tap again.
+        return;
+      }
+
+      if (!video.videoWidth || !video.videoHeight) {
+        setCaptureError("The camera is still warming up. Tap the shutter again in a moment.");
+        return;
+      }
+
+      const canvas = document.createElement("canvas");
+      canvas.width = 1024;
+      canvas.height = 1024;
+      canvas
+        .getContext("2d")
+        ?.drawImage(video, 0, 0, video.videoWidth, video.videoHeight, 0, 0, 1024, 1024);
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+
+      setSnapshot(dataUrl);
+      stopCamera();
+      setPhase("identifying");
+
+      await runIdentification(dataUrl);
+    } finally {
+      setIsCapturing(false);
     }
   }
 
   async function confirmDiscovery(suggestion: PlantSuggestion) {
     if (!user) return;
 
-    const foundBefore = discoveries.some(
-      (d) => d.user_id === user.id && d.scientific_name.toLowerCase() === suggestion.name.toLowerCase(),
-    );
+    // The write happens server-side with the service role: the browser's anon key cannot
+    // satisfy the `auth.uid() = user_id` INSERT policy, and points/daily limits are
+    // computed authoritatively there rather than trusted from the client.
+    try {
+      const result = await recordDiscovery({
+        data: {
+          userId: user.id,
+          scientificName: suggestion.name,
+          commonName: suggestion.commonNames[0] || "Unknown",
+          confidence: suggestion.probability,
+        },
+      });
 
-    const points = foundBefore ? 1 : 10;
+      if (!result.ok) {
+        setError(result.reason);
+        showToast(result.reason, "error");
+        setPhase("menu");
+        return;
+      }
 
-    // Check daily limits via RPC
-    const { data: limitCheck, error: limitError } = await supabase.rpc("check_daily_limits", {
-      p_user_id: user.id,
-      p_points: points,
-    });
+      setSuccessOverlay({ isNew: result.isNew, points: result.points });
+      showToast(result.isNew ? "New discovery!" : "Rediscovery logged!", "success");
 
-    if (limitError || !limitCheck?.[0]?.allowed) {
-      const message = limitCheck?.[0]?.message || "Daily limit reached";
-      setError(message);
-      showToast(message, "error");
-      setPhase("menu");
-      return;
+      // Refresh totals, collection and leaderboard immediately rather than waiting for the
+      // realtime subscription to fire.
+      void fetchDiscoveries();
+      void fetchLeaderboard();
+    } catch (err: unknown) {
+      console.error("Failed to save discovery:", err);
+      showToast(`Failed to save discovery: ${errorMessage(err)}`, "error");
     }
-
-    // Insert discovery
-    const { error: insertError } = await supabase.from("discoveries").insert({
-      user_id: user.id,
-      student: user.display_name,
-      scientific_name: suggestion.name,
-      common_name: suggestion.commonNames[0] || "Unknown",
-      points,
-      confidence: suggestion.probability,
-      found_at: new Date().toISOString(),
-    });
-
-    if (insertError) {
-      showToast("Failed to save discovery", "error");
-      return;
-    }
-
-    setSuccessOverlay({ isNew: !foundBefore, points });
-    showToast(foundBefore ? "Rediscovery logged!" : "New discovery!", "success");
   }
 
   if (phase === "login") {
@@ -715,7 +851,6 @@ function Index() {
         showHeader={false}
         studentName=""
         userPoints={0}
-        isVerified={false}
       >
         <div className="flex-1 flex flex-col justify-center items-center gap-8 py-10">
           <div className="flex flex-col items-center text-center animate-in fade-in duration-500">
@@ -724,7 +859,9 @@ function Index() {
               className="h-64 w-64 object-contain mb-8 drop-shadow-2xl animate-bounce-slow"
               alt="EFG Logo"
             />
-            <h1 className="text-4xl font-black tracking-tight text-white mb-1 drop-shadow-lg">EFG App</h1>
+            <h1 className="text-4xl font-black tracking-tight text-white mb-1 drop-shadow-lg">
+              EFG App
+            </h1>
             <h2 className="text-sm font-bold text-[color:var(--acs-gold)] tracking-widest uppercase">
               Environment Focus Group
             </h2>
@@ -781,77 +918,20 @@ function Index() {
         setPhase={setPhase}
         studentName={user?.display_name || ""}
         userPoints={userPoints}
-        isVerified={isVerified}
         onLogout={handleLogout}
       >
         <div className="flex-1 flex flex-col justify-center gap-6 py-6">
-          {/* Location Verification Card - Three states: unknown, verified, outside */}
-          {locationState === "unknown" ? (
-            <div className="liquid-glass-blue p-6 rounded-[2rem] border-[color:var(--efg-grey-blue)]/30 animate-in slide-up-100 duration-300">
-              <div className="flex items-center gap-4 mb-4">
-                <div className="bg-[color:var(--efg-grey-blue)]/20 p-3 rounded-xl">
-                  <Shield className="h-6 w-6 text-[color:var(--efg-grey-blue)]" />
-                </div>
-                <div className="flex-1">
-                  <h3 className="text-lg font-black text-white mb-1">Location Unknown</h3>
-                  <p className="text-white/60 text-sm">Tap to verify you are within ACS Independent</p>
-                </div>
-              </div>
-              <ActionButton variant="secondary" onClick={checkVerification} className="w-full">
-                <span className="flex items-center justify-center gap-2">
-                  <Shield className="h-4 w-4" />
-                  Verify Location
-                </span>
-              </ActionButton>
-            </div>
-          ) : locationState === "outside" ? (
-            <div className="liquid-glass-red p-6 rounded-[2rem] border-red-500/30 animate-in slide-up-100 duration-300">
-              <div className="flex items-center gap-4 mb-4">
-                <div className="bg-red-500/20 p-3 rounded-xl">
-                  <ShieldAlert className="h-6 w-6 text-red-400" />
-                </div>
-                <div className="flex-1">
-                  <h3 className="text-lg font-black text-white mb-1">Not in School Area</h3>
-                  <p className="text-white/60 text-sm">You must be within 0.5km of ACS Independent to identify plants</p>
-                </div>
-              </div>
-              <ActionButton variant="danger" onClick={checkVerification} className="w-full">
-                <span className="flex items-center justify-center gap-2">
-                  <ShieldAlert className="h-4 w-4" />
-                  Verify Location Now
-                </span>
-              </ActionButton>
-              <p className="text-[10px] text-white/40 text-center mt-3">
-                Tap the button above to check your GPS location
-              </p>
-            </div>
-          ) : (
-            <button
-              onClick={checkVerification}
-              className="liquid-glass p-6 rounded-[2rem] text-left active:scale-95 transition-all group border-l-4 border-emerald-500/50 hover:border-opacity-75"
-            >
-              <div className="flex items-center gap-3 mb-1 text-emerald-400">
-                <ShieldCheck className="h-5 w-5" />
-                <span className="font-bold uppercase text-xs tracking-widest">Location Verified</span>
-              </div>
-              <p className="text-[9px] font-medium text-white/40 uppercase leading-relaxed tracking-wider">
-                You are within ACS Independent
-              </p>
-            </button>
-          )}
-
           <button
             onClick={startCamera}
-            disabled={locationState !== "verified"}
-            className={`liquid-glass-beige border-white/20 text-white font-black py-12 rounded-[3rem] flex flex-col items-center gap-4 active:scale-95 transition-all group relative overflow-hidden hover:shadow-2xl ${
-              locationState !== "verified" ? "opacity-50 cursor-not-allowed" : ""
-            }`}
+            className="liquid-glass-beige border-white/20 text-white font-black py-12 rounded-[3rem] flex flex-col items-center gap-4 active:scale-95 transition-all group relative overflow-hidden hover:shadow-2xl"
           >
             <div className="absolute inset-0 bg-black/10 pointer-events-none" />
             <div className="bg-black/40 p-6 rounded-full group-hover:scale-110 transition-transform shadow-xl border border-white/10 relative z-10">
               <Camera className="h-10 w-10 text-[color:var(--efg-beige)]" />
             </div>
-            <span className="tracking-[0.1em] text-sm drop-shadow-lg font-black text-white relative z-10">Identify Plant</span>
+            <span className="tracking-[0.1em] text-sm drop-shadow-lg font-black text-white relative z-10">
+              Identify Plant
+            </span>
           </button>
 
           <div className="grid grid-cols-2 gap-4">
@@ -881,7 +961,9 @@ function Index() {
             <div className="bg-black/40 p-2.5 rounded-full group-hover:scale-110 transition-transform shadow-lg border border-white/10 relative z-10">
               <Info className="h-5 w-5 text-[color:var(--efg-grey-blue)]" />
             </div>
-            <span className="text-[11px] font-black text-white tracking-widest relative z-10">App Credits & Feedback</span>
+            <span className="text-[11px] font-black text-white tracking-widest relative z-10">
+              App Credits & Feedback
+            </span>
           </button>
         </div>
       </PageContainer>
@@ -907,17 +989,32 @@ function Index() {
         >
           <ChevronLeft className="h-8 w-8 stroke-[3]" />
         </IconButton>
+        {captureError && (
+          <div
+            role="alert"
+            className="absolute top-24 left-6 right-6 liquid-glass-red border-2 border-red-500/40 rounded-2xl p-4 flex items-start gap-3 animate-in slide-up-100 duration-200"
+          >
+            <ShieldAlert className="h-5 w-5 text-red-400 flex-shrink-0 mt-0.5" />
+            <p className="text-sm font-medium text-white leading-snug">{captureError}</p>
+          </div>
+        )}
         <div className="absolute bottom-12 left-0 right-0 flex justify-center items-center">
           <button
             onClick={capture}
-            className="h-20 w-20 rounded-full border-4 border-white flex items-center justify-center active:scale-90 shadow-2xl bg-white/20 backdrop-blur-sm transition-transform hover:scale-105"
+            disabled={isCapturing}
+            aria-busy={isCapturing}
+            className="h-20 w-20 rounded-full border-4 border-white flex items-center justify-center active:scale-90 shadow-2xl bg-white/20 backdrop-blur-sm transition-transform hover:scale-105 disabled:opacity-70"
             aria-label="Capture photo"
           >
-            <div className="h-16 w-16 rounded-full bg-white shadow-inner" />
+            {isCapturing ? (
+              <div className="h-16 w-16 rounded-full border-4 border-white/30 border-t-white animate-spin" />
+            ) : (
+              <div className="h-16 w-16 rounded-full bg-white shadow-inner" />
+            )}
           </button>
         </div>
         <p className="absolute bottom-28 left-1/2 -translate-x-1/2 text-white/60 text-sm text-center px-4">
-          Position the plant in the frame and tap the shutter
+          {isCapturing ? "Checking your location…" : "Location is re-checked with every photo"}
         </p>
       </div>
     );
@@ -930,7 +1027,6 @@ function Index() {
         setPhase={setPhase}
         studentName={user?.display_name || ""}
         userPoints={userStats?.total_points || 0}
-        isVerified={isVerified}
       >
         <LoadingOverlay />
       </PageContainer>
@@ -945,12 +1041,16 @@ function Index() {
         backTo="menu"
         studentName={user?.display_name || ""}
         userPoints={userStats?.total_points || 0}
-        isVerified={isVerified}
         title="Matches"
       >
         <div className="flex-1 py-6 grid gap-4">
           {suggestions.length === 0 ? (
-            <NoResultsCard onRetry={() => { setPhase("menu"); stopCamera(); }} />
+            <ErrorCard
+              kind="not_found"
+              details={error}
+              onRetry={() => void startCamera()}
+              onBack={() => setPhase("menu")}
+            />
           ) : (
             suggestions.map((s) => (
               <ResultCard
@@ -977,18 +1077,7 @@ function Index() {
     );
   }
 
-  if (phase === "badges") {
-    const userBadges = useMemo(() => {
-      if (!user || !discoveries?.length) return [];
-      const unique = new Map<string, Discovery>();
-      discoveries
-        .filter((d) => d.user_id === user.id)
-        .forEach((d) => {
-          if (d.scientific_name && !unique.has(d.scientific_name)) unique.set(d.scientific_name, d);
-        });
-      return Array.from(unique.values());
-    }, [discoveries, user]);
-
+  if (phase === "error") {
     return (
       <PageContainer
         phase={phase}
@@ -996,7 +1085,27 @@ function Index() {
         backTo="menu"
         studentName={user?.display_name || ""}
         userPoints={userStats?.total_points || 0}
-        isVerified={isVerified}
+      >
+        <div className="flex-1 flex flex-col justify-center py-8">
+          <ErrorCard
+            kind={errorKind}
+            details={error}
+            onRetry={() => void startCamera()}
+            onBack={() => setPhase("menu")}
+          />
+        </div>
+      </PageContainer>
+    );
+  }
+
+  if (phase === "badges") {
+    return (
+      <PageContainer
+        phase={phase}
+        setPhase={setPhase}
+        backTo="menu"
+        studentName={user?.display_name || ""}
+        userPoints={userStats?.total_points || 0}
         title="Collection"
       >
         <div className="flex-1 py-8 grid grid-cols-2 gap-x-8 gap-y-12 justify-items-center">
@@ -1004,7 +1113,9 @@ function Index() {
             <div className="col-span-2 flex flex-col items-center justify-center py-12 text-center">
               <Shield className="h-16 w-16 text-white/20 mb-4" />
               <p className="text-white/60 text-sm">No discoveries yet</p>
-              <p className="text-[11px] text-white/40 mt-1">Start identifying plants to build your collection</p>
+              <p className="text-[11px] text-white/40 mt-1">
+                Start identifying plants to build your collection
+              </p>
             </div>
           ) : (
             userBadges.filter(Boolean).map((b) => <BadgeCard key={b.id} badge={b} />)
@@ -1022,7 +1133,6 @@ function Index() {
         backTo="menu"
         studentName={user?.display_name || ""}
         userPoints={userStats?.total_points || 0}
-        isVerified={isVerified}
         title="Standing"
       >
         <div className="flex-1 flex flex-col gap-4 py-8">
@@ -1032,7 +1142,9 @@ function Index() {
               className={`liquid-glass px-8 py-6 rounded-[2.5rem] flex items-center justify-between group border-l-4 ${idx === 0 ? "border-[color:var(--acs-gold)]" : "border-white/5"}`}
             >
               <div className="flex items-center gap-6">
-                <span className={`text-2xl font-black ${idx === 0 ? "text-[color:var(--acs-gold)]" : "text-white/10"}`}>
+                <span
+                  className={`text-2xl font-black ${idx === 0 ? "text-[color:var(--acs-gold)]" : "text-white/10"}`}
+                >
                   #{idx + 1}
                 </span>
                 <span className="font-bold text-lg text-white group-hover:text-[color:var(--acs-gold)] transition-colors tracking-tight">
@@ -1070,7 +1182,6 @@ function Index() {
         backTo={user ? "menu" : "login"}
         studentName={user?.display_name || ""}
         userPoints={userStats?.total_points || 0}
-        isVerified={isVerified}
         title="Credits"
       >
         <div className="flex-1 flex flex-col items-center justify-center py-10 gap-8">
@@ -1084,13 +1195,16 @@ function Index() {
             </h3>
 
             <p className="text-sm font-medium text-white/60 leading-relaxed mb-8 px-4">
-              This application was designed and developed by the Environment Focus Group (EFG) CCA at ACS Independent.
+              This application was designed and developed by the Environment Focus Group (EFG) CCA
+              at ACS Independent.
             </p>
 
             <div className="liquid-glass-dark p-6 rounded-2xl border-white/10">
               <div className="flex items-center justify-center gap-3 mb-2">
                 <MessageSquare className="h-4 w-4 text-[color:var(--acs-gold)]" />
-                <span className="text-[11px] font-bold text-white uppercase tracking-widest">Feedback</span>
+                <span className="text-[11px] font-bold text-white uppercase tracking-widest">
+                  Feedback
+                </span>
               </div>
               <p className="text-sm font-semibold text-[color:var(--acs-gold)]">
                 Contact Selvakumar Madhan via MS Teams
@@ -1099,7 +1213,9 @@ function Index() {
           </GlassCard>
 
           <div className="text-center space-y-2 opacity-30">
-            <p className="text-[10px] font-bold tracking-widest uppercase">ACS Independent • 2026</p>
+            <p className="text-[10px] font-bold tracking-widest uppercase">
+              ACS Independent • 2026
+            </p>
             <img src="/efg-logo.png" className="h-10 w-10 grayscale mx-auto" alt="Logo" />
           </div>
         </div>

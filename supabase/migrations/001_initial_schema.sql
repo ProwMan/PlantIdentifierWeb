@@ -34,16 +34,29 @@ CREATE INDEX IF NOT EXISTS idx_users_class_name ON users(class_name);
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE discoveries ENABLE ROW LEVEL SECURITY;
 
--- Policies: Users can read all users, but only insert/update their own
+-- Everyone holding the anon key may READ: the leaderboard lists every student, and the
+-- Collection page reads the signed-in student's own discoveries.
+--
+-- Writes deliberately have NO policy here. This app authenticates with its own
+-- name + class scheme instead of Supabase Auth, so `auth.uid()` is always NULL for the
+-- browser and a policy such as `auth.uid() = user_id` can never be satisfied — a
+-- client-side insert would always fail. All writes go through the server functions in
+-- src/lib/api/identify.functions.ts, which use the service role (it bypasses RLS).
+-- Adding an INSERT/UPDATE policy would therefore not enable anything real, it would only
+-- widen access, so RLS stays default-deny for writes.
+DROP POLICY IF EXISTS "Users can read all users" ON users;
 CREATE POLICY "Users can read all users" ON users FOR SELECT USING (true);
-CREATE POLICY "Users can insert own profile" ON users FOR INSERT WITH CHECK (auth.uid() = id);
-CREATE POLICY "Users can update own profile" ON users FOR UPDATE USING (auth.uid() = id);
 
--- Policies: Discoveries - everyone can read, users can insert their own
+DROP POLICY IF EXISTS "Anyone can read discoveries" ON discoveries;
 CREATE POLICY "Anyone can read discoveries" ON discoveries FOR SELECT USING (true);
-CREATE POLICY "Users can insert own discoveries" ON discoveries FOR INSERT WITH CHECK (auth.uid() = user_id);
 
 -- Function to get leaderboard data
+--
+-- PL/pgSQL resolves a bare name that matches BOTH a RETURNS TABLE output parameter and a
+-- column in the query as ambiguous and aborts the whole call:
+--   ERROR: column reference "student" is ambiguous
+-- The browser swallowed that error, so the leaderboard was always empty. Every column below
+-- is therefore table-qualified and every CTE column is aliased away from an output name.
 CREATE OR REPLACE FUNCTION get_leaderboard()
 RETURNS TABLE (
   student TEXT,
@@ -55,50 +68,54 @@ DECLARE
   one_week_ago TIMESTAMPTZ := NOW() - INTERVAL '7 days';
 BEGIN
   RETURN QUERY
-  WITH all_discoveries AS (
-    SELECT * FROM discoveries
+  -- Totals are grouped by user_id, not by the `student` text. discoveries.student is a
+  -- denormalised label that older rows stored as the plain name while users.display_name
+  -- appends the class ("Ada Lovelace" vs "Ada Lovelace (1.01)"), so joining on the text
+  -- left every one of those students showing 0 points. user_id is the stable key.
+  WITH totals AS (
+    SELECT d.user_id AS uid,
+           MAX(COALESCE(u.display_name, d.student)) AS s_name,
+           SUM(d.points)::BIGINT AS pts
+    FROM discoveries d
+    LEFT JOIN users u ON u.id = d.user_id
+    GROUP BY d.user_id
   ),
-  total_scores AS (
-    SELECT student, SUM(points)::BIGINT AS total_points
-    FROM all_discoveries
-    GROUP BY student
+  weekly AS (
+    SELECT d.user_id AS uid, SUM(d.points)::BIGINT AS pts
+    FROM discoveries d
+    WHERE d.found_at >= one_week_ago
+    GROUP BY d.user_id
   ),
-  weekly_scores AS (
-    SELECT student, SUM(points)::BIGINT AS weekly_points
-    FROM all_discoveries
-    WHERE found_at >= one_week_ago
-    GROUP BY student
+  daily AS (
+    SELECT d.user_id AS uid,
+           TO_CHAR(d.found_at AT TIME ZONE 'Asia/Singapore', 'Day') AS day_name,
+           COUNT(*)::INTEGER AS n
+    FROM discoveries d
+    WHERE d.found_at >= one_week_ago
+    GROUP BY d.user_id, TO_CHAR(d.found_at AT TIME ZONE 'Asia/Singapore', 'Day')
   ),
-  daily_activity AS (
-    SELECT
-      student,
-      TO_CHAR(found_at AT TIME ZONE 'Asia/Singapore', 'Day') AS day_name,
-      COUNT(*)::INTEGER AS count
-    FROM all_discoveries
-    WHERE found_at >= one_week_ago
-    GROUP BY student, TO_CHAR(found_at AT TIME ZONE 'Asia/Singapore', 'Day')
-  ),
-  activity_json AS (
-    SELECT
-      student,
-      JSONB_OBJECT_AGG(day_name, count) AS activity
-    FROM daily_activity
-    GROUP BY student
+  activity AS (
+    SELECT da.uid, JSONB_OBJECT_AGG(da.day_name, da.n) AS j
+    FROM daily da
+    GROUP BY da.uid
   )
-  SELECT
-    ts.student,
-    ts.total_points,
-    COALESCE(ws.weekly_points, 0) AS weekly_points,
-    COALESCE(aj.activity, '{}'::JSONB) AS activity
-  FROM total_scores ts
-  LEFT JOIN weekly_scores ws ON ts.student = ws.student
-  LEFT JOIN activity_json aj ON ts.student = aj.student
-  ORDER BY ts.total_points DESC
+  SELECT t.s_name, t.pts, COALESCE(w.pts, 0), COALESCE(a.j, '{}'::JSONB)
+  FROM totals t
+  LEFT JOIN weekly w ON w.uid = t.uid
+  LEFT JOIN activity a ON a.uid = t.uid
+  ORDER BY t.pts DESC, t.s_name ASC
   LIMIT 10;
 END;
 $$;
 
 -- Function to get user stats
+-- Function to get user stats
+--
+-- Same PL/pgSQL name-resolution trap as get_leaderboard: `total_points`, `weekly_points`,
+-- `rank` and `unique_species` are output parameters here, so a bare reference to a CTE
+-- column with one of those names is ambiguous and the call fails with
+--   ERROR: column reference "total_points" is ambiguous
+-- The browser swallowed that error too, which is why every student saw 0 points forever.
 CREATE OR REPLACE FUNCTION get_user_stats(p_user_id UUID)
 RETURNS TABLE (
   total_points BIGINT,
@@ -110,43 +127,40 @@ DECLARE
   one_week_ago TIMESTAMPTZ := NOW() - INTERVAL '7 days';
 BEGIN
   RETURN QUERY
-  WITH user_discoveries AS (
-    SELECT * FROM discoveries WHERE user_id = p_user_id
-  ),
-  all_totals AS (
-    SELECT student, SUM(points)::BIGINT AS total_points
-    FROM discoveries
-    GROUP BY student
+  -- Keyed on user_id for the same reason as get_leaderboard: the denormalised
+  -- discoveries.student text does not always equal users.display_name, and matching on it
+  -- made real totals read as 0.
+  WITH totals AS (
+    SELECT d.user_id AS uid,
+           MAX(COALESCE(u.display_name, d.student)) AS s_name,
+           SUM(d.points)::BIGINT AS pts
+    FROM discoveries d
+    LEFT JOIN users u ON u.id = d.user_id
+    GROUP BY d.user_id
   ),
   ranked AS (
-    SELECT student, total_points, ROW_NUMBER() OVER (ORDER BY total_points DESC) AS rnk
-    FROM all_totals
-  ),
-  user_rank AS (
-    SELECT rnk FROM ranked WHERE student = (SELECT display_name FROM users WHERE id = p_user_id)
-  ),
-  weekly AS (
-    SELECT SUM(points)::BIGINT AS weekly_points
-    FROM user_discoveries
-    WHERE found_at >= one_week_ago
-  ),
-  unique_count AS (
-    SELECT COUNT(DISTINCT scientific_name) AS unique_species
-    FROM user_discoveries
+    SELECT t.uid, ROW_NUMBER() OVER (ORDER BY t.pts DESC, t.s_name) AS rnk
+    FROM totals t
   )
   SELECT
-    (SELECT total_points FROM all_totals WHERE student = (SELECT display_name FROM users WHERE id = p_user_id))::BIGINT,
-    COALESCE((SELECT weekly_points FROM weekly), 0)::BIGINT,
-    COALESCE((SELECT rnk FROM user_rank), 0)::INTEGER,
-    (SELECT unique_species FROM unique_count)::INTEGER;
+    COALESCE((SELECT t.pts FROM totals t WHERE t.uid = p_user_id), 0)::BIGINT,
+    COALESCE((SELECT SUM(d.points) FROM discoveries d
+              WHERE d.user_id = p_user_id AND d.found_at >= one_week_ago), 0)::BIGINT,
+    COALESCE((SELECT r.rnk FROM ranked r WHERE r.uid = p_user_id), 0)::INTEGER,
+    (SELECT COUNT(DISTINCT d.scientific_name) FROM discoveries d WHERE d.user_id = p_user_id)::INTEGER;
 END;
 $$;
 
 -- Function to check daily limits
+--
+-- The old expression, DATE_TRUNC('day', NOW()) AT TIME ZONE 'Asia/Singapore', truncated in
+-- UTC and then re-read the result as Singapore wall time, so the "day" started at 16:00 SGT
+-- instead of midnight. Truncating the Singapore wall clock first and then converting back to
+-- a timestamptz gives midnight SGT.
 CREATE OR REPLACE FUNCTION check_daily_limits(p_user_id UUID, p_points INTEGER)
 RETURNS TABLE (allowed BOOLEAN, message TEXT) LANGUAGE plpgsql AS $$
 DECLARE
-  start_of_day TIMESTAMPTZ := DATE_TRUNC('day', NOW()) AT TIME ZONE 'Asia/Singapore';
+  start_of_day TIMESTAMPTZ := DATE_TRUNC('day', NOW() AT TIME ZONE 'Asia/Singapore') AT TIME ZONE 'Asia/Singapore';
   today_new_discoveries INTEGER;
   today_rediscoveries INTEGER;
 BEGIN
@@ -173,6 +187,18 @@ END;
 $$;
 
 -- Grant execute permissions
-GRANT EXECUTE ON FUNCTION get_leaderboard() TO authenticated;
-GRANT EXECUTE ON FUNCTION get_user_stats(UUID) TO authenticated;
-GRANT EXECUTE ON FUNCTION check_daily_limits(UUID, INTEGER) TO authenticated;
+-- The browser talks to Supabase with the anon key, so it needs EXECUTE on the read
+-- functions. Postgres grants EXECUTE to PUBLIC by default, but state it explicitly so
+-- this script does not depend on that.
+GRANT EXECUTE ON FUNCTION get_leaderboard() TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION get_user_stats(UUID) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION check_daily_limits(UUID, INTEGER) TO anon, authenticated;
+GRANT EXECUTE ON FUNCTION check_daily_limits(UUID, INTEGER) TO service_role;
+
+-- Table privileges. Supabase's default privileges normally cover these for the public
+-- schema; stated explicitly so the script is self-contained and re-runnable. RLS still
+-- applies to anon/authenticated (they are not the table owner), so these grants expose
+-- only what the SELECT policies above allow.
+GRANT USAGE ON SCHEMA public TO anon, authenticated, service_role;
+GRANT SELECT ON users, discoveries TO anon, authenticated;
+GRANT ALL ON users, discoveries TO service_role;

@@ -44,10 +44,13 @@ export const emailWeeklyTopScorers = functions.pubsub
       const oneWeekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
 
       const snapshot = await db.collection("discoveries").get();
-      const allDiscoveries: Discovery[] = snapshot.docs.map((doc) => ({
-        id: doc.id,
-        ...doc.data(),
-      } as Discovery));
+      const allDiscoveries: Discovery[] = snapshot.docs.map(
+        (doc) =>
+          ({
+            id: doc.id,
+            ...doc.data(),
+          }) as Discovery,
+      );
 
       const totalScores: Record<string, number> = {};
       const weeklyScores: Record<string, number> = {};
@@ -76,8 +79,7 @@ export const emailWeeklyTopScorers = functions.pubsub
             "Saturday",
           ][discDate.getDay()];
 
-          dailyActivity[student][dayName] =
-            (dailyActivity[student][dayName] || 0) + 1;
+          dailyActivity[student][dayName] = (dailyActivity[student][dayName] || 0) + 1;
         }
       });
 
@@ -134,23 +136,16 @@ export const emailWeeklyTopScorers = functions.pubsub
 `;
 
       topScorers.forEach((scorer, index) => {
-        const days = [
-          "Monday",
-          "Tuesday",
-          "Wednesday",
-          "Thursday",
-          "Friday",
-          "Saturday",
-          "Sunday",
-        ];
+        const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
         const activityList = days
           .map(
             (day) =>
-              `<span class="day"><strong>${day.slice(0, 3)}</strong>: ${scorer.activity[day] || 0}</span>`
+              `<span class="day"><strong>${day.slice(0, 3)}</strong>: ${scorer.activity[day] || 0}</span>`,
           )
           .join("");
 
-        const rankClass = index === 0 ? "rank-1" : index === 1 ? "rank-2" : index === 2 ? "rank-3" : "rank-other";
+        const rankClass =
+          index === 0 ? "rank-1" : index === 1 ? "rank-2" : index === 2 ? "rank-3" : "rank-other";
 
         htmlContent += `
         <div class="scorer">

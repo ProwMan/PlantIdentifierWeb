@@ -14,15 +14,10 @@ module.exports = {
   parserOptions: {
     sourceType: "module",
   },
-  ignorePatterns: [
-    "/lib/**/*",
-  ],
-  plugins: [
-    "import",
-    "@typescript-eslint",
-  ],
+  ignorePatterns: ["/lib/**/*"],
+  plugins: ["import", "@typescript-eslint"],
   rules: {
     "import/no-unresolved": 0,
-    "indent": ["error", 2],
+    indent: ["error", 2],
   },
 };

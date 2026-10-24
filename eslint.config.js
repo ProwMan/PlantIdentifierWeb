@@ -36,5 +36,15 @@ export default tseslint.config(
       "@typescript-eslint/no-unused-vars": "off",
     },
   },
+  {
+    // shadcn/ui primitives intentionally co-export their cva variant helpers next to the
+    // component (e.g. `buttonVariants`, imported by pagination.tsx). That keeps
+    // `npx shadcn add <component>` regeneration clean, but it is not a
+    // fast-refresh-compatible module shape, so the rule is scoped off for them only.
+    files: ["src/components/ui/**/*.{ts,tsx}"],
+    rules: {
+      "react-refresh/only-export-components": "off",
+    },
+  },
   eslintPluginPrettier,
 );
