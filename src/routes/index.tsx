@@ -117,6 +117,7 @@ function PageContainer({
   studentName,
   userPoints,
   title,
+  hint,
   onLogout,
 }: {
   children: React.ReactNode;
@@ -127,6 +128,7 @@ function PageContainer({
   studentName: string;
   userPoints: number;
   title?: string;
+  hint?: string;
   onLogout?: () => void;
 }) {
   return (
@@ -183,9 +185,18 @@ function PageContainer({
             )}
           </div>
           {title && (
-            <h2 className="text-3xl short:text-2xl font-black text-white drop-shadow-md">
-              {title}
-            </h2>
+            <div>
+              <h2 className="text-3xl short:text-2xl font-black text-white drop-shadow-md leading-tight">
+                {title}
+              </h2>
+              {/* Sits in normal flow under the heading — never absolutely positioned, so it
+                  cannot overlap the list or be squeezed onto the matches below it. */}
+              {hint && (
+                <p className="mt-1.5 text-[11px] font-semibold text-white/45 leading-snug">
+                  {hint}
+                </p>
+              )}
+            </div>
           )}
         </header>
       )}
@@ -1062,6 +1073,7 @@ function Index() {
         studentName={user?.display_name || ""}
         userPoints={userStats?.total_points || 0}
         title="Matches"
+        hint="Tap a plant to log it"
       >
         <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar content-start py-6 grid gap-4">
           {suggestions.length === 0 ? (
