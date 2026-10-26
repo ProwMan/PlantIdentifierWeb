@@ -18,6 +18,7 @@ import {
   CheckCircle,
   XCircle,
   Sparkles,
+  Settings,
 } from "lucide-react";
 import {
   identifyPlant,
@@ -129,10 +130,13 @@ function PageContainer({
   onLogout?: () => void;
 }) {
   return (
-    <div className="min-h-screen triangle-bg flex flex-col items-center overflow-hidden font-sans">
+    // Exactly one viewport tall with its own overflow clipped: the page itself never scrolls
+    // or rubber-bands on a phone. Regions that can outgrow the screen scroll internally
+    // instead — the leaderboard list, the collection grid and the match list.
+    <div className="h-[100dvh] w-full triangle-bg flex flex-col items-center overflow-hidden font-sans">
       {showHeader && (
-        <header className="w-full max-w-md px-6 pt-10 pb-6 bg-transparent sticky top-0 z-20">
-          <div className="flex items-center justify-between mb-4">
+        <header className="w-full max-w-md shrink-0 px-6 pt-10 pb-6 short:pt-5 short:pb-3 bg-transparent z-20">
+          <div className="flex items-center justify-between mb-4 short:mb-2">
             {backTo ? (
               <button
                 onClick={() => setPhase(backTo)}
@@ -145,14 +149,16 @@ function PageContainer({
               <div className="flex items-center gap-4">
                 <img
                   src="/efg-logo.png"
-                  className="h-16 w-16 object-contain drop-shadow-xl transition-transform hover:scale-105"
+                  className="h-16 w-16 short:h-11 short:w-11 object-contain drop-shadow-xl transition-transform hover:scale-105"
                   alt="EFG Logo"
                 />
                 <div className="flex flex-col">
                   <h1 className="text-[10px] font-bold text-[color:var(--acs-gold)] tracking-[0.2em] uppercase">
                     EFG App
                   </h1>
-                  <h2 className="text-2xl font-black text-white leading-tight">ACS Independent</h2>
+                  <h2 className="text-2xl short:text-xl font-black text-white leading-tight">
+                    ACS Independent
+                  </h2>
                 </div>
               </div>
             )}
@@ -176,10 +182,14 @@ function PageContainer({
               </div>
             )}
           </div>
-          {title && <h2 className="text-3xl font-black text-white drop-shadow-md">{title}</h2>}
+          {title && (
+            <h2 className="text-3xl short:text-2xl font-black text-white drop-shadow-md">
+              {title}
+            </h2>
+          )}
         </header>
       )}
-      <div className="w-full max-w-md flex-1 flex flex-col relative px-6 overflow-y-auto no-scrollbar">
+      <div className="w-full max-w-md flex-1 min-h-0 flex flex-col relative px-6 overflow-hidden">
         {children}
       </div>
     </div>
@@ -307,11 +317,13 @@ function ResultCard({
   onConfirm,
   user,
   discoveries,
+  disabled = false,
 }: {
   suggestion: PlantSuggestion;
   onConfirm: (s: PlantSuggestion) => void;
   user: User | null;
   discoveries: Discovery[];
+  disabled?: boolean;
 }) {
   if (!suggestion) return null;
   const foundBefore =
@@ -325,7 +337,9 @@ function ResultCard({
   return (
     <button
       onClick={() => onConfirm(suggestion)}
-      className="liquid-glass p-5 text-left flex items-center gap-5 transition-all rounded-[2rem] border-white/10 group hover:border-[color:var(--acs-gold)]/30 shadow-xl active:scale-[0.98]"
+      disabled={disabled}
+      aria-busy={disabled}
+      className="liquid-glass p-5 short:p-4 text-left flex items-center gap-5 transition-all rounded-[2rem] border-white/10 group hover:border-[color:var(--acs-gold)]/30 shadow-xl active:scale-[0.98] disabled:opacity-60"
     >
       <div className="flex-1 min-w-0">
         <h3 className="text-white font-bold italic text-lg leading-tight group-hover:text-[color:var(--acs-gold)] transition-colors truncate">
@@ -405,7 +419,7 @@ export function ErrorCard({
   const Icon = kind === "not_found" ? XCircle : kind === "camera" ? Camera : AlertCircle;
 
   return (
-    <div className="liquid-glass p-8 rounded-[2rem] border-white/10 text-center flex flex-col items-center gap-6">
+    <div className="liquid-glass p-8 short:p-5 rounded-[2rem] border-white/10 text-center flex flex-col items-center gap-6 short:gap-4">
       <div
         className={`p-4 rounded-full ${kind === "not_found" ? "bg-red-500/20" : "bg-amber-500/20"}`}
       >
@@ -521,6 +535,9 @@ function Index() {
   const [successOverlay, setSuccessOverlay] = useState<{ isNew: boolean; points: number } | null>(
     null,
   );
+  // True from the tap on a match until the server confirms the write. The success overlay
+  // only appears after that round trip, so without this the app just sat there.
+  const [isConfirming, setIsConfirming] = useState(false);
 
   // Shutter state: true while a fresh GPS fix (and, after that, the request) is in flight.
   const [isCapturing, setIsCapturing] = useState(false);
@@ -808,7 +825,11 @@ function Index() {
   }
 
   async function confirmDiscovery(suggestion: PlantSuggestion) {
-    if (!user) return;
+    // A second tap while the first write is in flight would log the plant twice (double
+    // points), so repeat taps are ignored until the current one finishes.
+    if (!user || isConfirming) return;
+
+    setIsConfirming(true);
 
     // The write happens server-side with the service role: the browser's anon key cannot
     // satisfy the `auth.uid() = user_id` INSERT policy, and points/daily limits are
@@ -840,6 +861,8 @@ function Index() {
     } catch (err: unknown) {
       console.error("Failed to save discovery:", err);
       showToast(`Failed to save discovery: ${errorMessage(err)}`, "error");
+    } finally {
+      setIsConfirming(false);
     }
   }
 
@@ -852,14 +875,14 @@ function Index() {
         studentName=""
         userPoints={0}
       >
-        <div className="flex-1 flex flex-col justify-center items-center gap-8 py-10">
+        <div className="flex-1 flex flex-col justify-center items-center gap-8 short:gap-4 py-10 short:py-4">
           <div className="flex flex-col items-center text-center animate-in fade-in duration-500">
             <img
               src="/efg-logo.png"
-              className="h-64 w-64 object-contain mb-8 drop-shadow-2xl animate-bounce-slow"
+              className="h-64 w-64 short:h-40 short:w-40 object-contain mb-8 short:mb-4 drop-shadow-2xl animate-bounce-slow"
               alt="EFG Logo"
             />
-            <h1 className="text-4xl font-black tracking-tight text-white mb-1 drop-shadow-lg">
+            <h1 className="text-4xl short:text-3xl font-black tracking-tight text-white mb-1 drop-shadow-lg">
               EFG App
             </h1>
             <h2 className="text-sm font-bold text-[color:var(--acs-gold)] tracking-widest uppercase">
@@ -867,7 +890,7 @@ function Index() {
             </h2>
           </div>
 
-          <GlassCard className="w-full space-y-4">
+          <GlassCard className="w-full space-y-4 short:space-y-3">
             <div className="text-[10px] font-bold text-white/40 uppercase tracking-widest mb-4 text-center">
               Student Registration
             </div>
@@ -878,7 +901,7 @@ function Index() {
                 value={fullName}
                 onChange={(e) => setFullName(e.target.value)}
                 placeholder="Full Name"
-                className="w-full bg-black/40 border border-white/10 rounded-2xl pl-12 pr-5 py-4 text-white font-semibold placeholder:text-white/20 outline-none focus:border-[color:var(--acs-gold)]/50 transition-all shadow-inner"
+                className="w-full bg-black/40 border border-white/10 rounded-2xl pl-12 pr-5 py-4 short:py-3 text-white font-semibold placeholder:text-white/20 outline-none focus:border-[color:var(--acs-gold)]/50 transition-all shadow-inner"
                 autoComplete="name"
               />
             </div>
@@ -889,7 +912,7 @@ function Index() {
                 value={className}
                 onChange={(e) => setClassName(e.target.value)}
                 placeholder="Class (e.g. 1.01)"
-                className="w-full bg-black/40 border border-white/10 rounded-2xl pl-12 pr-5 py-4 text-white font-semibold placeholder:text-white/20 outline-none focus:border-[color:var(--acs-gold)]/50 transition-all shadow-inner"
+                className="w-full bg-black/40 border border-white/10 rounded-2xl pl-12 pr-5 py-4 short:py-3 text-white font-semibold placeholder:text-white/20 outline-none focus:border-[color:var(--acs-gold)]/50 transition-all shadow-inner"
                 autoComplete="off"
               />
             </div>
@@ -920,14 +943,14 @@ function Index() {
         userPoints={userPoints}
         onLogout={handleLogout}
       >
-        <div className="flex-1 flex flex-col justify-center gap-6 py-6">
+        <div className="flex-1 flex flex-col justify-center gap-6 short:gap-3 py-6 short:py-2">
           <button
             onClick={startCamera}
-            className="liquid-glass-beige border-white/20 text-white font-black py-12 rounded-[3rem] flex flex-col items-center gap-4 active:scale-95 transition-all group relative overflow-hidden hover:shadow-2xl"
+            className="liquid-glass-beige border-white/20 text-white font-black py-12 short:py-7 rounded-[3rem] short:rounded-[2.5rem] flex flex-col items-center gap-4 short:gap-3 active:scale-95 transition-all group relative overflow-hidden hover:shadow-2xl"
           >
             <div className="absolute inset-0 bg-black/10 pointer-events-none" />
-            <div className="bg-black/40 p-6 rounded-full group-hover:scale-110 transition-transform shadow-xl border border-white/10 relative z-10">
-              <Camera className="h-10 w-10 text-[color:var(--efg-beige)]" />
+            <div className="bg-black/40 p-6 short:p-4 rounded-full group-hover:scale-110 transition-transform shadow-xl border border-white/10 relative z-10">
+              <Camera className="h-10 w-10 short:h-8 short:w-8 text-[color:var(--efg-beige)]" />
             </div>
             <span className="tracking-[0.1em] text-sm drop-shadow-lg font-black text-white relative z-10">
               Identify Plant
@@ -937,7 +960,7 @@ function Index() {
           <div className="grid grid-cols-2 gap-4">
             <button
               onClick={() => setPhase("leaderboard")}
-              className="liquid-glass-olive p-8 rounded-[2.5rem] flex flex-col items-center gap-3 active:scale-95 transition-all border-white/20 group relative overflow-hidden"
+              className="liquid-glass-olive p-8 short:p-5 rounded-[2.5rem] flex flex-col items-center gap-3 active:scale-95 transition-all border-white/20 group relative overflow-hidden"
             >
               <div className="absolute inset-0 bg-black/10 pointer-events-none" />
               <Trophy className="h-6 w-6 text-[color:var(--efg-grey-olive)] group-hover:scale-110 transition-transform relative z-10" />
@@ -945,7 +968,7 @@ function Index() {
             </button>
             <button
               onClick={() => setPhase("badges")}
-              className="liquid-glass-gold p-8 rounded-[2.5rem] flex flex-col items-center gap-3 active:scale-95 transition-all border-white/20 group relative overflow-hidden"
+              className="liquid-glass-gold p-8 short:p-5 rounded-[2.5rem] flex flex-col items-center gap-3 active:scale-95 transition-all border-white/20 group relative overflow-hidden"
             >
               <div className="absolute inset-0 bg-black/10 pointer-events-none" />
               <Shield className="h-6 w-6 text-[color:var(--acs-gold)] group-hover:scale-110 transition-transform relative z-10" />
@@ -955,7 +978,7 @@ function Index() {
 
           <button
             onClick={() => setPhase("credits")}
-            className="mt-4 liquid-glass-blue p-5 rounded-[2rem] flex items-center justify-center gap-4 active:scale-95 transition-all border-white/10 group relative overflow-hidden"
+            className="mt-4 short:mt-2 liquid-glass-blue p-5 short:p-4 rounded-[2rem] flex items-center justify-center gap-4 short:gap-3 active:scale-95 transition-all border-white/10 group relative overflow-hidden"
           >
             <div className="absolute inset-0 bg-black/10 pointer-events-none" />
             <div className="bg-black/40 p-2.5 rounded-full group-hover:scale-110 transition-transform shadow-lg border border-white/10 relative z-10">
@@ -1013,9 +1036,6 @@ function Index() {
             )}
           </button>
         </div>
-        <p className="absolute bottom-28 left-1/2 -translate-x-1/2 text-white/60 text-sm text-center px-4">
-          {isCapturing ? "Checking your location…" : "Location is re-checked with every photo"}
-        </p>
       </div>
     );
   }
@@ -1043,7 +1063,7 @@ function Index() {
         userPoints={userStats?.total_points || 0}
         title="Matches"
       >
-        <div className="flex-1 py-6 grid gap-4">
+        <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar content-start py-6 grid gap-4">
           {suggestions.length === 0 ? (
             <ErrorCard
               kind="not_found"
@@ -1059,10 +1079,28 @@ function Index() {
                 onConfirm={confirmDiscovery}
                 user={user}
                 discoveries={discoveries}
+                disabled={isConfirming}
               />
             ))
           )}
         </div>
+        {isConfirming && (
+          <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center">
+            <div
+              role="status"
+              aria-live="polite"
+              className="liquid-glass-dark flex items-center gap-3 rounded-2xl border-[color:var(--acs-gold)]/40 px-5 py-3.5 shadow-2xl animate-in zoom-in-95 duration-200"
+            >
+              <Settings
+                className="h-5 w-5 animate-spin text-[color:var(--acs-gold)] [animation-duration:2.4s]"
+                aria-hidden="true"
+              />
+              <span className="text-[10px] font-black uppercase tracking-[0.18em] text-white/80">
+                Saving discovery
+              </span>
+            </div>
+          </div>
+        )}
         {successOverlay && (
           <SuccessOverlay
             isNewDiscovery={successOverlay.isNew}
@@ -1086,7 +1124,7 @@ function Index() {
         studentName={user?.display_name || ""}
         userPoints={userStats?.total_points || 0}
       >
-        <div className="flex-1 flex flex-col justify-center py-8">
+        <div className="flex-1 flex flex-col justify-center py-8 short:py-2">
           <ErrorCard
             kind={errorKind}
             details={error}
@@ -1108,7 +1146,7 @@ function Index() {
         userPoints={userStats?.total_points || 0}
         title="Collection"
       >
-        <div className="flex-1 py-8 grid grid-cols-2 gap-x-8 gap-y-12 justify-items-center">
+        <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar content-start py-8 grid grid-cols-2 gap-x-8 gap-y-12 justify-items-center">
           {userBadges.length === 0 ? (
             <div className="col-span-2 flex flex-col items-center justify-center py-12 text-center">
               <Shield className="h-16 w-16 text-white/20 mb-4" />
@@ -1135,7 +1173,7 @@ function Index() {
         userPoints={userStats?.total_points || 0}
         title="Standing"
       >
-        <div className="flex-1 flex flex-col gap-4 py-8">
+        <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar flex flex-col gap-3 py-6">
           {leaderboard.map((e, idx) => (
             <div
               key={e.student}
@@ -1157,7 +1195,7 @@ function Index() {
             </div>
           ))}
         </div>
-        <div className="mb-14 mt-auto p-8 liquid-glass-dark border-t-4 border-[color:var(--acs-gold)]/40 rounded-[3rem] shadow-2xl flex justify-between items-center bg-gradient-to-br from-black/60 to-transparent">
+        <div className="mb-6 short:mb-3 mt-auto shrink-0 p-6 short:p-4 liquid-glass-dark border-t-4 border-[color:var(--acs-gold)]/40 rounded-[3rem] shadow-2xl flex justify-between items-center bg-gradient-to-br from-black/60 to-transparent">
           <div className="flex items-center gap-5">
             <span className="text-2xl font-black text-[color:var(--acs-gold)] drop-shadow-lg">
               #{userStats?.rank || "-"}
@@ -1184,7 +1222,7 @@ function Index() {
         userPoints={userStats?.total_points || 0}
         title="Credits"
       >
-        <div className="flex-1 flex flex-col items-center justify-center py-10 gap-8">
+        <div className="flex-1 flex flex-col items-center justify-center py-10 short:py-4 gap-8 short:gap-4">
           <GlassCard className="w-full text-center">
             <div className="bg-gradient-to-br from-[color:var(--acs-gold)] to-[#e5a500] p-6 rounded-full inline-block mb-6 shadow-xl">
               <Heart className="h-10 w-10 text-[color:var(--acs-blue-dark)]" />
